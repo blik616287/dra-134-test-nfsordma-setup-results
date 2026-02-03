@@ -1,0 +1,1091 @@
+# ============================================================================
+# Ubuntu MAAS Layer with NFSoRDMA and SR-IOV Support
+# ============================================================================
+#
+# REQUIRED CLUSTER VARIABLES:
+# ---------------------------
+# Add these variables to your Spectro Cloud cluster profile:
+#
+# ## SR-IOV Configuration (for BlueField-3 DPUs in SuperNIC mode)
+# EnableSRIOV: "true"
+# numberOfVFs: "0"              # Not used - BlueField-3 detected as DPU type
+# numberofDPUVFs: "4"           # VFs for DPU-type NICs (BlueField-3)
+# ControlDPUs: "true"           # Allow nodeprep to configure DPUs
+# DPUOffloadEngine: "false"     # Keep SuperNIC mode (INTERNAL_CPU_OFFLOAD_ENGINE=DISABLED)
+# disableACS: "true"            # Disable ACS for proper PCIe peer-to-peer
+#
+# ## NFSoRDMA Configuration
+# NFSoRDMAEnabled: "true"
+# NFSServerOnCP: "true"         # Install NFS server on control-plane
+# NFSExportPath: "/srv/nfs/shared"
+# NFSRDMANetwork: "10.0.100.0/24"
+# NFSServerRDMAIP: "10.0.100.1"
+# NFSClientRDMAIPBase: "10.0.100"  # Workers get .2, .3, etc.
+# RDMAInterface: "enp14s0f0np0"    # First BlueField-3 port
+#
+# ## Existing Required Variables (from base profile)
+# MaaSURI: "http://<maas-server>:5248/MAAS"
+# K8sNodeCIDR: "172.16.32.0/24"
+# NodeprepCP: "true"
+# UpdatePackages: "false"
+# BfbBundle: "bf-fwbundle-3.2.1-34_25.11-prod.bfb"
+# BFBFW: "32.47.1088"
+# DocaDebFile: "doca-host_3.2.1-044000-25.10-ubuntu2204_amd64.deb"
+# LinkType_EW: "Ethernet"
+# LinkType_NS: "Ethernet"
+# InstallNVNCC: "false"
+# NVNCCDebFile: ""
+#
+# ============================================================================
+# Hardware Detection Notes:
+# - BlueField-3 B3220 P-Series DPUs are detected as "DPU" type by nodeprep
+# - Even in SuperNIC mode, the script uses numberofDPUVFs (not numberOfVFs)
+# - INTERNAL_CPU_OFFLOAD_ENGINE=DISABLED(1) = SuperNIC mode
+# - INTERNAL_CPU_OFFLOAD_ENGINE=ENABLED(0) = Full DPU mode
+# ============================================================================
+#
+# NFSoRDMA POD USAGE:
+# ------------------
+# Use PV/PVC with RDMA mount options. Kubelet passes mountOptions to mount cmd.
+#
+# PersistentVolume:
+#   apiVersion: v1
+#   kind: PersistentVolume
+#   metadata:
+#     name: nfs-rdma-pv
+#   spec:
+#     capacity:
+#       storage: 100Gi
+#     accessModes:
+#       - ReadWriteMany
+#     persistentVolumeReclaimPolicy: Retain
+#     mountOptions:
+#       - proto=rdma
+#       - port=20049
+#       - vers=4.1
+#       - rsize=1048576
+#       - wsize=1048576
+#     nfs:
+#       server: 10.0.100.1    # Use RDMA network IP
+#       path: /srv/nfs/shared
+#
+# PersistentVolumeClaim:
+#   apiVersion: v1
+#   kind: PersistentVolumeClaim
+#   metadata:
+#     name: nfs-rdma-pvc
+#   spec:
+#     accessModes:
+#       - ReadWriteMany
+#     resources:
+#       requests:
+#         storage: 100Gi
+#     volumeName: nfs-rdma-pv
+#     storageClassName: ""
+#
+# Pod:
+#   apiVersion: v1
+#   kind: Pod
+#   metadata:
+#     name: my-workload
+#   spec:
+#     containers:
+#     - name: app
+#       image: your-image
+#       volumeMounts:
+#       - name: nfs-data
+#         mountPath: /data
+#     volumes:
+#     - name: nfs-data
+#       persistentVolumeClaim:
+#         claimName: nfs-rdma-pvc
+#     nodeSelector:
+#       spectrocloud.com/nfsordma: enabled
+#
+# IMPORTANT: Use the RDMA network IP (10.0.100.1) not the node IP (172.16.32.42)
+# Worker nodes must have xprtrdma module loaded and RDMA network connectivity.
+#
+# ============================================================================
+
+kubeadmconfig:
+  preKubeadmCommands:
+    - 'echo "====> Applying pre Kubeadm commands"'
+    # Force specific IP address as the Node InternalIP for kubelet
+    - |
+      apt update && apt install -y grepcidr
+      NETWORKS="{{ .spectro.var.K8sNodeCIDR }}"
+      IPS=$(hostname -I)
+      for IP in $IPS
+      do
+        echo "$IP" | grepcidr "$NETWORKS" >/dev/null && echo " --node-ip=$IP" >> /etc/default/kubelet
+        if [ $? -eq 0 ]; then break; fi
+      done
+    # Install nfs-common for Longhorn and NFS clients
+    - apt install -y nfs-common
+    # Install NFSoRDMA kernel modules (compatible with MLNX OFED)
+    - |
+      if "{{.spectro.var.NFSoRDMAEnabled}}"; then
+        echo "====> Installing NFSoRDMA support"
+        # Will be fully configured after DOCA is installed in nodeprep
+        # Pre-create module load config
+        echo "rpcrdma" > /etc/modules-load.d/nfsrdma.conf
+        echo "xprtrdma" >> /etc/modules-load.d/nfsrdma.conf
+        echo "svcrdma" >> /etc/modules-load.d/nfsrdma.conf
+      fi
+    # Update CA certs
+    - update-ca-certificates
+    # Update initramfs
+    - update-initramfs -u
+    # Reload and restart containerd
+    - systemctl daemon-reload
+    - systemctl restart containerd
+    # Hold kernel packages to prevent kernel changes during apt updates
+    - |
+      apt-mark hold $(apt-mark showauto linux-\*image-\*)
+      apt-mark hold $(apt-mark showauto linux-\*headers-\*)
+      apt-mark hold $(apt-mark showauto linux-\*modules-\*)
+      apt-mark hold $(apt-mark showauto linux-\*cloud-tools-\*)
+      apt-mark hold $(apt-mark showauto linux-\*tools-\*)
+      apt-mark hold $(apt-mark showmanual linux-\*image-\*)
+      apt-mark hold $(apt-mark showmanual linux-\*headers-\*)
+      apt-mark hold $(apt-mark showmanual linux-\*modules-\*)
+      apt-mark hold $(apt-mark showmanual linux-\*cloud-tools-\*)
+      apt-mark hold $(apt-mark showmanual linux-\*tools-\*)
+  postKubeadmCommands:
+    - 'echo "====> Applying post Kubeadm commands"'
+    # Delete the kube-proxy daemonset and configmap for Cilium eBPF native mode
+    - |
+      if test -f /etc/kubernetes/admin.conf; then
+        echo "======> Cilium prep for kube-proxy-less (control-plane)"
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        until $(kubectl -n kube-system delete --ignore-not-found=true ds kube-proxy > /dev/null); do
+          echo "Failed to delete kube-proxy daemonset, will retry in 5s"
+          sleep 5
+        done
+        until $(kubectl -n kube-system delete --ignore-not-found=true cm kube-proxy > /dev/null); do
+          echo "Failed to delete kube-proxy configmap, will retry in 5s"
+          sleep 5
+        done
+        iptables-save | grep -v KUBE | iptables-restore
+      fi
+    # Setup NFS Server with RDMA on control-plane node
+    - |
+      if test -f /etc/kubernetes/admin.conf && "{{.spectro.var.NFSServerOnCP}}"; then
+        echo "======> Setting up NFS Server with RDMA support on control-plane"
+
+        # Install NFS server
+        NEEDRESTART_MODE=l apt-get install -y nfs-kernel-server
+
+        # Create export directory
+        mkdir -p {{.spectro.var.NFSExportPath}}
+        chmod 777 {{.spectro.var.NFSExportPath}}
+        chown nobody:nogroup {{.spectro.var.NFSExportPath}}
+
+        # Configure exports - allow pod network, node network, and RDMA network
+        cat > /etc/exports <<EXPORTS
+{{.spectro.var.NFSExportPath}}  10.0.0.0/8(rw,sync,no_subtree_check,no_root_squash) 172.16.0.0/12(rw,sync,no_subtree_check,no_root_squash) {{.spectro.var.NFSRDMANetwork}}(rw,sync,no_subtree_check,no_root_squash)
+EXPORTS
+
+        # Create systemd service for persistent RDMA port (will be started after DOCA/nodeprep)
+        cat > /etc/systemd/system/nfs-rdma.service <<NFSRDMA
+[Unit]
+Description=Enable NFS over RDMA
+After=nfs-server.service
+Requires=nfs-server.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/sbin/modprobe rpcrdma
+ExecStart=/bin/bash -c 'echo "rdma 20049" > /proc/fs/nfsd/portlist'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+NFSRDMA
+
+        systemctl daemon-reload
+        systemctl enable nfs-rdma.service
+
+        echo "======> NFS Server configured, RDMA will be enabled after nodeprep completes"
+      fi
+    # Run nodeprep, tag CP nodes for Longhorn storage
+    - |
+      if test -f /etc/kubernetes/admin.conf; then
+        kubectl annotate node $(hostname) node.longhorn.io/default-node-tags='["storage"]' --kubeconfig /etc/kubernetes/admin.conf
+        if "{{.spectro.var.NodeprepCP}}"; then
+          /opt/spectrocloud/nodeprep.sh
+        else
+          kubectl taint nodes $(hostname) spectrocloud.com/nodeprep- --kubeconfig /etc/kubernetes/admin.conf
+        fi
+      else
+        /opt/spectrocloud/nodeprep.sh
+      fi
+  files:
+    - targetPath: /etc/modprobe.d/blacklist-nouveau.conf
+      targetOwner: "root:root"
+      targetPermissions: "0755"
+      content: |-
+        blacklist nouveau
+        blacklist lbm-nouveau
+        options nouveau modeset=0
+        alias nouveau off
+        alias lbm-nouveau off
+    - targetPath: /etc/systemd/system/containerd.service.d/override.conf
+      targetOwner: "root:root"
+      targetPermissions: "0755"
+      content: |-
+        [Service]
+        # allow children (shims/containers) to inherit unlimited memlock
+        LimitMEMLOCK=infinity
+        # (optional but common in HPC)
+        LimitNOFILE=1048576
+        LimitNPROC=infinity
+    - targetPath: /etc/kubernetes/kubelet.conf.d/10-kubelet-tuning.conf
+      targetOwner: "root:root"
+      targetPermissions: "0644"
+      content: |-
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        cpuManagerPolicy: static
+        reservedSystemCPUs: "0"
+        maxPods: 250
+        registerWithTaints:
+          - key: spectrocloud.com/nodeprep
+            effect: NoSchedule
+    - targetPath: /usr/local/share/ca-certificates/org_ca.crt
+      targetOwner: "root:root"
+      targetPermissions: "0644"
+      content: |
+        -----BEGIN CERTIFICATE-----
+        MIIDHzCCAgegAwIBAgIUC2VKm0kzJFb8sDxcYIAHpRsrkZwwDQYJKoZIhvcNAQEL
+        BQAwEjEQMA4GA1UEAwwHcm9vdF9jYTAeFw0yMzA1MTUwMjI3MDdaFw0yOTAxMjYx
+        MDI3MzdaMA0xCzAJBgNVBAMTAmNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIB
+        CgKCAQEA1xaF23C53r7hOjAY6lTeNX5aBCaF9scdl/Dt4G16eKLRbGhOxdglk6N1
+        A6nrErJMxk8QIFY33ZBKCDGIvefsDEoHX7J9MTjlSpvXJgyjLsmRUhWvTOnNf+oe
+        xdIC2dRWuU+8y/6JbnaWfx4hYyLbYEguJyrFrFUjwQ1bdJIChnvzRFUV43uKLENC
+        vR/CiWy/v9m7itCl4WmVRw6+4GLv/IYzSc+EWpC4Rr/z8beQT0l+fmAgdakyfuKP
+        Icuo6QhKSszZxGUnVnh5LVKkHGdk9TgGBEEp1Ja6YI9k2ODiugnNMgJbIdf8TmXd
+        jXWCo1Db+6IsrWPqjwCPrrDQolDD6QIDAQABo3IwcDAOBgNVHQ8BAf8EBAMCAQYw
+        DwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUKq7+i3gHH5s3WZGkL5C09SG7fN4w
+        HwYDVR0jBBgwFoAUsuhA2cGXGoYZZzAeJrIVHkkkwFgwDQYDVR0RBAYwBIICY2Ew
+        DQYJKoZIhvcNAQELBQADggEBABsD4LDofyRC2cVas0QlECYfSrJhtIVxD5CsGurO
+        pWpYIvTnC5AMSX5PpWlc3nAnv5OMGs+G+jD4paEQRPofZvjA+fUUMLVNtVOv0p9E
+        Dm5FpgZB1wR1crieejAXDl8wOlO54BBCK/3vkIgtcaUJ3WrOCoI8QU0NEvYhBZW3
+        +vt2oini0M5J5keB3kVKrfuQHQs41yMmWLWpuz5GlX5354IpDoDyeEzx6/Q0Uqhg
+        espKDCkDqjNYIhrhHnhXOW8fGOspOISfDKj5H6bgfKAF3TFfqd5P+AdzZNand8cC
+        euKlWnTpf9FTumw6znzybwsmfUUopmY17mN65V8X91ks15Y=
+        -----END CERTIFICATE-----
+    - targetPath: /opt/spectrocloud/nodeprep.sh
+      targetOwner: "root:root"
+      targetPermissions: "0755"
+      content: |-
+        #!/bin/bash
+        MAAS="{{.spectro.var.MaaSURI}}"
+
+        # Download BFB from https://developer.nvidia.com/networking/blue-os-eula?mtag=bluefield_sw_drivers&mrequest=downloads&mtype=BlueField&mver=FW-Bundle&mfile=bf-fwbundle-3.2.1-34_25.11-prod.bfb
+        # Place BFB on MAAS server in /var/snap/maas/common/maas/tftp_root/rcp/firmware/bfb/bf-fwbundle-3.2.1-34_25.11-prod.bfb
+        # Latest for Spectrum-X 2.0: bf-fwbundle-3.2.1-34_25.11-prod.bfb
+        # Firmware version for above BFB: 32.47.1088
+        BFB="{{.spectro.var.BfbBundle}}"
+        BFB_FW="{{.spectro.var.BFBFW}}"
+
+        # Download DEB from https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.1/host/doca-host_3.2.1-044000-25.10-ubuntu2204_amd64.deb
+        # Place DEB on MAAS server in /var/snap/maas/common/maas/tftp_root/rcp/doca-host_3.2.1-044000-25.10-ubuntu2204_amd64.deb
+        # Latest for Spectrum-X 2.0: doca-host_3.2.1-044000-25.10-ubuntu2204_amd64.deb
+        DOCA_DEB="{{.spectro.var.DocaDebFile}}"
+
+        APT_UPDATE="{{.spectro.var.UpdatePackages}}"
+
+        LINKTYPE_EW_VAR="{{.spectro.var.LinkType_EW}}"
+        LINKTYPE_NS_VAR="{{.spectro.var.LinkType_NS}}"
+        if [ "$LINKTYPE_EW_VAR" == "Infiniband" ]; then LINKTYPE_EW=1; else LINKTYPE_EW=2; fi
+        if [ "$LINKTYPE_NS_VAR" == "Infiniband" ]; then LINKTYPE_NS=1; else LINKTYPE_NS=2; fi
+
+        CONTROLDPU="{{.spectro.var.ControlDPUs}}"
+        if "{{.spectro.var.DPUOffloadEngine}}"; then
+          DPUOFFLOAD=0
+        else
+          DPUOFFLOAD=1
+        fi
+
+        # Retrieve NVN CC package from Nvidia directly (not publicly available)
+        # Place DEB on MAAS server in /var/snap/maas/common/maas/tftp_root/rcp/spcx-cc/ubuntu22.04-x86_64/doca-spcx-cc_3.1.0105-1_amd64.deb
+        NVNCC="{{.spectro.var.InstallNVNCC}}"
+        NVNCC_DEB="{{.spectro.var.NVNCCDebFile}}"
+
+        if [ "$LINKTYPE_EW" == "1" ]; then
+          ROCECC="0"
+        else
+          ROCECC="1"
+        fi
+
+        if "{{.spectro.var.EnableSRIOV}}"; then
+          NUMVF_EW="{{.spectro.var.numberOfVFs}}"
+          NUMVF_NS="{{.spectro.var.numberofDPUVFs}}"
+        else
+          NUMVF_EW=0
+          NUMVF_NS=0
+        fi
+        DISABLE_ACS="{{.spectro.var.disableACS}}"
+        CP_DELAY=1800
+
+        # NFSoRDMA Configuration
+        NFSORDMA_ENABLED="{{.spectro.var.NFSoRDMAEnabled}}"
+        NFS_SERVER_ON_CP="{{.spectro.var.NFSServerOnCP}}"
+        NFS_EXPORT_PATH="{{.spectro.var.NFSExportPath}}"
+        NFS_SERVER_RDMA_IP="{{.spectro.var.NFSServerRDMAIP}}"
+        NFS_CLIENT_RDMA_IP_BASE="{{.spectro.var.NFSClientRDMAIPBase}}"
+        RDMA_INTERFACE="{{.spectro.var.RDMAInterface}}"
+
+        LOG_FILE="/var/log/sc-nodeprep.log"
+        exec > >(tee -a ${LOG_FILE}) 2>&1
+        export KUBECONFIG=/etc/kubernetes/kubelet.conf
+
+        declare -A arrBF
+        total_amount=0
+
+        do_log(){
+          print_ok() {
+            GREEN_COLOR="\033[0;32m"
+            DEFAULT="\033[0m"
+            echo -e "${GREEN_COLOR}${1:-}${DEFAULT}"
+          }
+          print_warning() {
+            YELLOW_COLOR="\033[33m"
+            DEFAULT="\033[0m"
+            echo -e "${YELLOW_COLOR}${1:-}${DEFAULT}"
+          }
+          print_info() {
+            BLUE_COLOR="\033[1;34m"
+            DEFAULT="\033[0m"
+            echo -e "${BLUE_COLOR}${1:-}${DEFAULT}"
+          }
+          print_fail() {
+            RED_COLOR="\033[0;31m"
+            DEFAULT="\033[0m"
+            echo -e "${RED_COLOR}${1:-}${DEFAULT}"
+          }
+
+          type_of_msg=$(echo $*|cut -d" " -f1)
+          msg="$(echo $*|cut -d" " -f2-)"
+          msg=" [$type_of_msg] `date "+%Y-%m-%d %H:%M:%S %Z"` [$] $msg "
+          case "$type_of_msg" in
+            'FATAL') print_fail "$msg" ;;
+            'ERROR') print_fail "$msg" ;;
+            'WARN') print_warning "$msg" ;;
+            'INFO') print_info "$msg" ;;
+            'OK') print_ok "$msg" ;;
+            *) echo "$msg" ;;
+          esac
+        }
+
+        fn_ensure_nodeprep() {
+          if systemctl list-units | grep stylus-agent; then
+            do_log "INFO Running in Agent/Appliance mode, nodeprep is controlled by Stylus."
+          else
+            if grep "/opt/spectrocloud/nodeprep.sh" /etc/rc.local &>/dev/null
+            then
+              do_log "INFO Ensured that nodeprep is called at system startup."
+            else
+              do_log "INFO Nodeprep is not yet being called at system startup, configuring..."
+              echo '#!/bin/bash' > /etc/rc.local
+              echo '/opt/spectrocloud/nodeprep.sh' >> /etc/rc.local
+              chmod +x /etc/rc.local
+              do_log "OK Ensured that nodeprep is called at system startup."
+            fi
+          fi
+        }
+
+        fn_ensure_state() {
+          do_log "INFO Checking node state..."
+          until [ "$(kubectl get node $(hostname) -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" == "True" ]; do
+            do_log "INFO Node not yet reporting ready state, will retry in 5s"
+            sleep 5
+          done
+          TEST=$(kubectl get node $(hostname) -o jsonpath="{.metadata.labels.spectrocloud\.com/nodeprep}")
+          if [ "$TEST" == "" ]
+          then
+            do_log "INFO Node state not present, setting new node state..."
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nodeprep=init"
+          else
+            do_log "OK Node state found, parsing state..."
+          fi
+          STATE=$(kubectl get node $(hostname) -o jsonpath="{.metadata.labels.spectrocloud\.com/nodeprep}")
+          do_log "INFO Nodeprep state is: $STATE"
+          if ! systemctl list-units | grep stylus-agent && [ -f /etc/kubernetes/admin.conf ] && [ $STATE == "init" ]; then
+            if ! kubectl get node $(hostname) -o jsonpath='{.spec.taints}' --kubeconfig /etc/kubernetes/admin.conf | grep "spectrocloud.com/nodeprep"; then
+              do_log "INFO This is a fresh control plane node, ensuring cert-manager is installed..."
+              kubectl taint nodes $(hostname) spectrocloud.com/nodeprep- --kubeconfig /etc/kubernetes/admin.conf
+              while [ $(kubectl get secret -n cert-manager -l owner=helm,name=cert-manager,status=deployed --kubeconfig /etc/kubernetes/admin.conf | wc -l) -eq 0 ]; do
+                do_log "INFO Cert-manager not yet deployed, waiting for 3 seconds..."
+                sleep 3
+              done
+              do_log "INFO This is a fresh control plane node, waiting for $CP_DELAY seconds before performing node prep actions..."
+              sleep $CP_DELAY
+              do_log "INFO Wait over, retainting node"
+              kubectl taint nodes $(hostname) spectrocloud.com/nodeprep:NoSchedule --kubeconfig /etc/kubernetes/admin.conf
+              do_log "INFO Cluster state verified"
+            fi
+          fi
+        }
+
+        fn_update_state() {
+          local next_state=$1
+          local next_step=$2
+          do_log "INFO Setting next stage to $next_state..."
+          kubectl label node $(hostname) --overwrite "spectrocloud.com/nodeprep=$next_state"
+          if [ "$next_step" == "reboot" ]
+          then
+            do_log "INFO Reboot requested, scheduling node reboot in 1 minute"
+            shutdown -r +1
+          fi
+        }
+
+        fn_process_result() {
+          if [ $1 -eq 0 ]; then
+            do_log "OK Succeeded: $2"
+          else
+            do_log "FATAL Failed: $2"
+            exit 1
+          fi
+        }
+
+        fn_inventory_hw() {
+          local n=0
+          for pci in $(mst status -v | grep -i -E "(bluefield|connectx)" | awk '{print $3}' | grep "\.0"); do
+            ((n++))
+            arrBF[$n,0]="$pci"
+            arrBF[$n,1]="${pci/\.*/}"
+            arrBF[$n,2]="0000:${arrBF[$n,0]}"
+            arrBF[$n,3]="0000:${arrBF[$n,1]}"
+
+            local DESCR=$(mlxconfig -d "${arrBF[$n,2]}" q INTERNAL_CPU_OFFLOAD_ENGINE | grep "Description:")
+            if echo "$DESCR" | grep "SuperNIC" >/dev/null; then
+              arrBF[$n,4]="SuperNIC"
+            elif echo "$DESCR" | grep "DPU" >/dev/null; then
+              arrBF[$n,4]="DPU"
+            elif echo "$DESCR" | grep "ConnectX" >/dev/null; then
+              arrBF[$n,4]="ConnectX"
+            else
+              arrBF[$n,4]="Unknown"
+            fi
+
+            for dir in $(find /dev -type d -name "rshim*"); do
+              local RSHIMPCI=$(cat $dir/misc | grep DEV_NAME | awk '{print $2}' | awk -F "." '{print $1}')
+              if [ "$RSHIMPCI" == "pcie-${arrBF[$n,3]}" ]; then
+                arrBF[$n,5]="$dir"
+              fi
+            done
+
+            arrBF[$n,6]=$(ls "/sys/bus/pci/devices/${arrBF[$n,2]}/net/")
+            arrBF[$n,7]=$(flint -d "${arrBF[$n,2]}" q | grep "FW Version:" | awk '{print $3}')
+            arrBF[$n,8]="$(cat /sys/bus/pci/devices/${arrBF[$n,2]}/current_link_width)x"
+            arrBF[$n,9]="$(cat /sys/bus/pci/devices/${arrBF[$n,2]}/max_link_speed | awk '{print $1}')GTs"
+
+            do_log "INFO Detected NIC ${arrBF[$n,6]} on PCI address: ${arrBF[$n,0]} of type ${arrBF[$n,4]} with firmware ${arrBF[$n,7]}"
+          done
+          total_amount=$n
+          do_log "INFO Adding NIC firmware info for ${arrBF[$n,6]} to node labels..."
+          for i in $(seq 1 $total_amount); do
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-type=${arrBF[$i,4]}" > /dev/null
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-fw=${arrBF[$i,7]}" > /dev/null
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-addr=${arrBF[$i,1]/:/\.}" > /dev/null
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-name=${arrBF[$i,6]}" > /dev/null
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-linkwidth=${arrBF[$i,8]}" > /dev/null
+            kubectl label node $(hostname) --overwrite "spectrocloud.com/nic-$i-linkspeed=${arrBF[$i,9]}" > /dev/null
+          done
+          gpu_n=0
+          lspci -D | grep -E "3D controller: NVIDIA" | while read device; do
+            ((gpu_n++))
+            bus=$(echo $device | awk '{print $1}')
+            sysfs_path="/sys/bus/pci/devices/$bus"
+            if [ -f "$sysfs_path/max_link_speed" ]; then
+              gpu_name=$(echo $device | sed 's/.*: //' | sed 's/ (rev.*//')
+              speed="$(cat $sysfs_path/max_link_speed | awk '{print $1}')GTs"
+              width="$(cat $sysfs_path/current_link_width)x"
+              do_log "INFO Detected GPU $gpu_n ($gpu_name) on $width PCI link width and max link speed of $speed"
+              do_log "INFO Adding PCIe link info for GPU $gpu_n to to node labels..."
+              kubectl label node $(hostname) --overwrite "spectrocloud.com/gpu-${gpu_n}-linkspeed=${speed}" > /dev/null
+              kubectl label node $(hostname) --overwrite "spectrocloud.com/gpu-${gpu_n}-linkwidth=${width}" > /dev/null
+            fi
+          done
+        }
+
+        fn_init_sw_stage() {
+          do_log "INFO Init stage: Install prereqs, flash BFB..."
+
+          if ! [[ -d /bfb && -d /scripts ]]; then
+            do_log "INFO Create /opt/spectrocloud/spcx/bfb directory"
+            mkdir -p /opt/spectrocloud/spcx/bfb
+            fn_process_result $? "Create /opt/spectrocloud/spcx/bfb directory"
+          else
+            do_log "OK Directory /opt/spectrocloud/spcx/bfb is present"
+          fi
+
+          if ! [ -f /opt/spectrocloud/spcx/bfb/$BFB ]; then
+            do_log "INFO Download $MAAS/rcp/firmware/bfb/$BFB to /opt/spectrocloud/spcx/bfb/"
+            wget --retry-on-host-error --no-verbose -t 5 "$MAAS/rcp/firmware/bfb/$BFB" -O /opt/spectrocloud/spcx/bfb/$BFB.tmp && mv /opt/spectrocloud/spcx/bfb/$BFB.tmp /opt/spectrocloud/spcx/bfb/$BFB
+            fn_process_result $? "Download $MAAS/rcp/firmware/bfb/$BFB to /opt/spectrocloud/spcx/bfb/"
+          else
+            do_log "OK /opt/spectrocloud/spcx/bfb/$BFB is present"
+          fi
+
+          if ! [ -f /opt/spectrocloud/spcx/$DOCA_DEB ]; then
+            do_log "INFO Retrieve DOCA repo package from $MAAS/rcp/$DOCA_DEB"
+            wget --retry-on-host-error --no-verbose -t 5 "$MAAS/rcp/$DOCA_DEB" -O /opt/spectrocloud/spcx/$DOCA_DEB.tmp && mv /opt/spectrocloud/spcx/$DOCA_DEB.tmp /opt/spectrocloud/spcx/$DOCA_DEB
+            fn_process_result $? "Retrieve DOCA repo package from $MAAS/rcp/$DOCA_DEB"
+          else
+            do_log "OK /opt/spectrocloud/spcx/$DOCA_DEB is present"
+          fi
+
+          if $APT_UPDATE; then
+            do_log "INFO Updating packages to latest..."
+            apt-get update; NEEDRESTART_MODE=l apt-get upgrade -qq
+          fi
+
+          if ! [ "$(dpkg -s linux-headers-$(uname -r) | grep -e "^Status: " | awk -F ": " '{print $2}')" == "install ok installed" ]; then
+            do_log "INFO Linux headers package for current kernel is missing, installing it now"
+            NEEDRESTART_MODE=l apt-get install -qq linux-headers-$(uname -r)
+            fn_process_result $? "Install Linux headers package for current kernel"
+            apt-mark hold linux-headers-$(uname -r)
+            fn_process_result $? "Marked Linux headers package for current kernel as held"
+          else
+            do_log "OK Linux headers package for current kernel is present"
+          fi
+
+          if ! which gcc-12; then
+            do_log "INFO GCC-12 not present on the system and needed for DOCA, installing GCC-12"
+            NEEDRESTART_MODE=l apt install -y gcc-12 libgcc-12-dev
+            fn_process_result $? "Install GCC-12"
+          else
+            do_log "OK GCC-12 is installed"
+          fi
+
+          if ! [ "$(dpkg -s doca-host | grep -e "^Status: " | awk -F ": " '{print $2}')" == "install ok installed" ]; then
+            do_log "INFO Install DOCA repo package from /opt/spectrocloud/spcx/$DOCA_DEB"
+            dpkg -i /opt/spectrocloud/spcx/$DOCA_DEB
+            fn_process_result $? "Install DOCA repo package from /opt/spectrocloud/spcx/$DOCA_DEB"
+            apt-get -qq update
+            fn_process_result $? "Update APT after install DOCA repo package"
+          else
+            do_log "OK DOCA repo package is installed"
+          fi
+
+          if ! [ "$(dpkg -s doca-all | grep -e "^Status: " | awk -F ": " '{print $2}')" == "install ok installed" ]; then
+            do_log "INFO Install DOCA host software"
+            NEEDRESTART_MODE=l apt-get -qq install doca-all lldpd mft netplan.io pv psmisc
+            fn_process_result $? "Install DOCA host software"
+            do_log "INFO Host reboot is needed after installing DOCA, rebooting now..."
+            fn_update_state init reboot
+            exit 0
+          else
+            do_log "OK DOCA host package is installed"
+            do_log "INFO Ensuring additional packages are installed"
+            NEEDRESTART_MODE=l apt-get -qq install lldpd mft netplan.io pv psmisc
+            fn_process_result $? "Ensure additional packages"
+          fi
+
+          do_log "INFO Configure LLDP"
+          mkdir -p /etc/lldpd.d
+          echo "configure system hostname ." > /etc/lldpd.d/rcp-lldpd.conf
+          echo "configure lldp portidsubtype iframe" >> /etc/lldpd.d/rcp-lldpd.conf
+          chmod 644 /etc/lldpd.d/rcp-lldpd.conf
+          systemctl enable lldpd
+          fn_process_result $? "Configure LLDP"
+
+          do_log "INFO Spectrum-X Congestion Control software"
+          if $NVNCC; then
+            NCC="${NVNCC_DEB/*\//}"
+            if ! [ -f "/opt/spectrocloud/spcx/$NCC" ]; then
+              do_log "INFO Retrieve Spectrum-X Congestion Control software from $MAAS/rcp/$NVNCC_DEB"
+              wget --retry-on-host-error --no-verbose -t 5 "$MAAS/rcp/$NVNCC_DEB" -O /opt/spectrocloud/spcx/$NCC.tmp && mv /opt/spectrocloud/spcx/$NCC.tmp /opt/spectrocloud/spcx/$NCC
+              fn_process_result $? "Retrieve Spectrum-X Congestion Control software from $MAAS/rcp/$NVNCC_DEB"
+            else
+              do_log "OK /opt/spectrocloud/spcx/$NCC is present"
+            fi
+            if ! [ "$(dpkg -s doca-nvn-cc | grep -e "^Status: " | awk -F ": " '{print $2}')" == "install ok installed" ]; then
+              dpkg -i /opt/spectrocloud/spcx/$NCC
+              fn_process_result $? "Install Spectrum-X Congestion Control software from /opt/spectrocloud/spcx/$NCC"
+            else
+              do_log "OK Spectrum-X Congestion Control software is installed"
+            fi
+          else
+            do_log "INFO Spectrum-X Congestion Control software not enabled"
+          fi
+
+          if [ $NUMVF_EW -gt 0 ] || [ $NUMVF_NS -gt 0 ]; then
+            local UPDATE_GRUB=false
+            do_log "INFO VFs requested, ensuring that SRIOV is enabled on next boot..."
+            # Check if CPU is Intel or AMD, set correct IOMMU parameter for each
+            if lscpu | grep "Model name" | grep -i intel > /dev/null; then
+              if ! cat /etc/default/grub | grep GRUB_CMDLINE_LINUX_DEFAULT | grep intel_iommu=on > /dev/null; then
+                do_log "INFO Adding intel_iommu=on to GRUB config..."
+                sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&intel_iommu=on /' /etc/default/grub
+                UPDATE_GRUB=true
+              else
+                do_log "INFO intel_iommu=on is present in GRUB config"
+              fi
+            elif lscpu | grep "Model name" | grep -i amd > /dev/null; then
+              if ! cat /etc/default/grub | grep GRUB_CMDLINE_LINUX_DEFAULT | grep amd_iommu=on > /dev/null; then
+                do_log "INFO Adding amd_iommu=on to GRUB config..."
+                sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&amd_iommu=on /' /etc/default/grub
+                UPDATE_GRUB=true
+              else
+                do_log "INFO amd_iommu=on is present in GRUB config"
+              fi
+            fi
+            # Set IOMMU Passthrough for SRIOV
+            if ! cat /etc/default/grub | grep GRUB_CMDLINE_LINUX_DEFAULT | grep iommu=pt > /dev/null; then
+              do_log "INFO Adding iommu=pt to GRUB config..."
+              sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&iommu=pt /' /etc/default/grub
+              UPDATE_GRUB=true
+            else
+              do_log "INFO iommu=pt is present in GRUB config"
+            fi
+
+            # Enable exclusive mode for Infiniband for proper SR-IOV isolation
+            if ! cat /etc/default/grub | grep GRUB_CMDLINE_LINUX_DEFAULT | grep ib_core.netns_mode=0 > /dev/null; then
+              do_log "INFO Adding ib_core.netns_mode=0 to GRUB config..."
+              sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&ib_core.netns_mode=0 /' /etc/default/grub
+              UPDATE_GRUB=true
+            else
+              do_log "INFO ib_core.netns_mode=0 is present in GRUB config"
+            fi
+
+            # Run update-grub if the content of /etc/default/grub changed
+            if $UPDATE_GRUB; then
+              do_log "INFO GRUB config changed, running update-grub..."
+              update-grub
+            fi
+          fi
+
+          do_log "INFO Enable and restart rshim"
+          systemctl daemon-reload && systemctl enable rshim && systemctl restart rshim
+          fn_process_result $? "Enable and restart rshim"
+          do_log "INFO Sleeping for 10 seconds to allow rshim to initialize..."
+          sleep 10
+
+          do_log "INFO Verify rshim is running"
+          systemctl status rshim | grep "Active: active (running)"
+          fn_process_result $? "Verify rshim is running"
+
+          if $APT_UPDATE; then
+            do_log "INFO Running APT package cleanup..."
+            apt-get autoremove -qq
+          fi
+        }
+
+        fn_init_hw_stage() {
+          do_log "INFO Flash BFB to Bluefield-3 adapters"
+          for i in $(seq 1 $total_amount); do
+            if [ "${arrBF[$i,4]}" == "SuperNIC" ]; then
+              if [ "${arrBF[$i,7]}" == "$BFB_FW" ]; then
+                do_log "OK Bluefield-3 firmware already matches expectd version $BFB_FW, skipping flash."
+              else
+                do_log "INFO Flashing Bluefield-3 firmware to ${arrBF[$i,2]}..."
+                rshim_addr="${arrBF[$i,5]/\/dev\//}"
+                bfb-install --rshim $rshim_addr --bfb /opt/spectrocloud/spcx/bfb/$BFB --verbose
+                fn_process_result $? "Flash BFB to Bluefield-3 adapter ${arrBF[$i,2]} on $rshim_addr"
+                  NEEDREBOOT=true
+              fi
+            elif [ "${arrBF[$i,4]}" == "DPU" ]; then
+              if $CONTROLDPU; then
+                if [ "${arrBF[$i,7]}" == "$BFB_FW" ]; then
+                  do_log "OK Bluefield-3 firmware already matches expectd version $BFB_FW, skipping flash."
+                else
+                  do_log "INFO Flashing Bluefield-3 firmware to ${arrBF[$i,2]}..."
+                  rshim_addr="${arrBF[$i,5]/\/dev\//}"
+                  bfb-install --rshim $rshim_addr --bfb /opt/spectrocloud/spcx/bfb/$BFB --verbose
+                  fn_process_result $? "Flash BFB to Bluefield-3 adapter ${arrBF[$i,2]} on $rshim_addr"
+                  NEEDREBOOT=true
+                fi
+              else
+                do_log "INFO Control of DPUs is not allowed by policy, skipping DPU ${arrBF[$i,2]}"
+              fi
+            elif [ "${arrBF[$i,4]}" == "ConnectX" ]; then
+              do_log "INFO Firmware flashing of ConnectX adapters is not implemented, skipping ConnectX NIC ${arrBF[$i,2]}"
+            fi
+          done
+        }
+
+        fn_config_stage(){
+          do_log "INFO Configure network adapter firmware"
+          if [ $NUMVF_EW -gt 1 ]; then CNX_NUM_OF_VFS=$NUMVF_EW; else CNX_NUM_OF_VFS=1; fi
+          if [ $NUMVF_NS -gt 1 ]; then DPU_NUM_OF_VFS=$NUMVF_NS; else DPU_NUM_OF_VFS=1; fi
+          for i in $(seq 1 $total_amount); do
+            if [ "${arrBF[$i,4]}" == "SuperNIC" ]; then
+              /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y reset
+              if /usr/bin/mlxconfig -d "${arrBF[$i,2]}" q LINK_TYPE_P2 >/dev/null; then
+                /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_EW LINK_TYPE_P2=$LINKTYPE_EW ROCE_ADAPTIVE_ROUTING_EN=$ROCECC USER_PROGRAMMABLE_CC=$ROCECC TX_SCHEDULER_LOCALITY_MODE=2 ADVANCED_PCI_SETTINGS=1 NUM_OF_VFS=$CNX_NUM_OF_VFS
+              else
+                /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_EW ROCE_ADAPTIVE_ROUTING_EN=$ROCECC USER_PROGRAMMABLE_CC=$ROCECC TX_SCHEDULER_LOCALITY_MODE=2 ADVANCED_PCI_SETTINGS=1 NUM_OF_VFS=$CNX_NUM_OF_VFS
+              fi
+              fn_process_result $? "Configure Bluefield-3 adapter firmware for ${arrBF[$i,0]}"
+            elif [ "${arrBF[$i,4]}" == "ConnectX" ]; then
+              /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y reset
+              if /usr/bin/mlxconfig -d "${arrBF[$i,2]}" q LINK_TYPE_P2 >/dev/null; then
+                /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_EW LINK_TYPE_P2=$LINKTYPE_EW ROCE_ADAPTIVE_ROUTING_EN=$ROCECC TX_SCHEDULER_LOCALITY_MODE=2 ADVANCED_PCI_SETTINGS=1 NUM_OF_VFS=$CNX_NUM_OF_VFS
+              else
+                /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_EW ROCE_ADAPTIVE_ROUTING_EN=$ROCECC TX_SCHEDULER_LOCALITY_MODE=2 ADVANCED_PCI_SETTINGS=1 NUM_OF_VFS=$CNX_NUM_OF_VFS
+              fi
+              fn_process_result $? "Configure ConnectX adapter firmware for ${arrBF[$i,0]}"
+            elif [ "${arrBF[$i,4]}" == "DPU" ]; then
+              if $CONTROLDPU; then
+                /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y reset
+                if /usr/bin/mlxconfig -d "${arrBF[$i,2]}" q LINK_TYPE_P2 >/dev/null; then
+                  /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_NS LINK_TYPE_P2=$LINKTYPE_NS INTERNAL_CPU_OFFLOAD_ENGINE=$DPUOFFLOAD NUM_OF_VFS=$DPU_NUM_OF_VFS
+                else
+                  /usr/bin/mlxconfig -d "${arrBF[$i,2]}" -y set LINK_TYPE_P1=$LINKTYPE_NS INTERNAL_CPU_OFFLOAD_ENGINE=$DPUOFFLOAD NUM_OF_VFS=$DPU_NUM_OF_VFS
+                fi
+                fn_process_result $? "Configure Bluefield-3 adapter firmware for ${arrBF[$i,0]}"
+              else
+                do_log "INFO Control of DPUs is not allowed by policy, skipping DPU ${arrBF[$i,2]}"
+              fi
+            fi
+          done
+        }
+
+        fn_disable_acs(){
+          do_log "INFO Disable ACS on all PCIe switches"
+          for BDF in `lspci -d "*:*:*" | awk '{print $1}'`; do
+            setpci -v -s ${BDF} ECAP_ACS+0x6.w > /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              do_log "INFO ${BDF} does not support ACS, skipping"
+              continue
+            fi
+            do_log "OK Disabling ACS on ${BDF}"
+            setpci -v -s ${BDF} ECAP_ACS+0x6.w=0000
+            if [ $? -ne 0 ]; then
+              do_log "ERROR ${BDF} Error disabling ACS on ${BDF}"
+              continue
+            fi
+            local NEW_VAL=`setpci -v -s ${BDF} ECAP_ACS+0x6.w | awk '{print $NF}'`
+            if [ "${NEW_VAL}" != "0000" ]; then
+              do_log "ERROR Failed to disable ACS on ${BDF}"
+              continue
+            fi
+          done
+        }
+
+        fn_set_vfs(){
+          if [ $NUMVF_EW -gt 0 ] || [ $NUMVF_NS -gt 0 ]; then
+            do_log "INFO Create VFs on network adapters"
+
+            # Cordon node during procedure
+            do_log "INFO Cordoning node for VF configuration..."
+            kubectl cordon $(hostname)
+
+            for i in $(seq 1 $total_amount); do
+              if [ "${arrBF[$i,4]}" == "SuperNIC" ] || [ "${arrBF[$i,4]}" == "ConnectX" ] || [ "${arrBF[$i,4]}" == "DPU" ]; then
+                local netif="${arrBF[$i,6]}"
+
+                if ! [ "$(ip -br link show dev $netif | awk '{print $2}')" == "UP" ]; then
+                  do_log "INFO Interface $netif is not in UP state, setting link to UP..."
+                  ip link set $netif up
+                  fn_process_result $? "Set interface $netif to UP state"
+                fi
+
+                if ([ "${arrBF[$i,4]}" == "SuperNIC" ] || [ "${arrBF[$i,4]}" == "ConnectX" ]) && [ $NUMVF_EW -gt 0 ]; then
+                  do_log "INFO Setting sriov_numvfs to $NUMVF_EW for ${arrBF[$i,4]} $netif"
+                  echo "$NUMVF_EW" > "/sys/class/net/$netif/device/sriov_numvfs"
+                  fn_process_result $? "Create $NUMVF_EW VFs for ${arrBF[$i,4]} $netif"
+                elif [ "${arrBF[$i,4]}" == "DPU" ] && [ $NUMVF_NS -gt 0 ]; then
+                  do_log "INFO Setting sriov_numvfs to $NUMVF_NS for DPU $netif"
+                  echo "$NUMVF_NS" > "/sys/class/net/$netif/device/sriov_numvfs"
+                  fn_process_result $? "Create $NUMVF_NS VFs for DPU $netif"
+                fi
+
+                # Wait for VFs to be created
+                sleep 2
+
+                if ([ "${arrBF[$i,4]}" == "SuperNIC" ] || [ "${arrBF[$i,4]}" == "ConnectX" ]) && [ "$LINKTYPE_EW" == "1" ]; then
+                  LINKTYPE="IB"
+                  LINKVFS=$NUMVF_EW
+                elif [ "${arrBF[$i,4]}" == "DPU" ] && [ "$LINKTYPE_NS" == "1" ]; then
+                  LINKTYPE="IB"
+                  LINKVFS=$NUMVF_NS
+                fi
+
+                if [ "$LINKTYPE" == "IB" ] && [ $LINKVFS -gt 0 ]; then
+                  # Link type is Infiniband, we need to do additional port configuration...
+                  do_log "INFO Link type is Infiniband, proceding to configure GUIDs..."
+
+                  # Find InfiniBand device name
+                  local ib_dev=""
+                  if [ -d "/sys/class/net/$netif/device/infiniband" ]; then
+                    ib_dev=$(ls "/sys/class/net/$netif/device/infiniband" | head -n1)
+                    do_log "INFO InfiniBand device for $netif is $ib_dev"
+                  else
+                    do_log "ERROR Could not find InfiniBand device for $netif"
+                    continue
+                  fi
+
+                  local nic_guid_src=$(cat /sys/class/net/$netif/device/infiniband/$ib_dev/node_guid)
+                  local nic_guid_raw=${nic_guid_src//:/}
+
+                  # Configure GUIDs for each VF
+                  for vf in $(seq 0 $((LINKVFS - 1))); do
+                    local vf_hex=$(printf "%02x" $vf)
+                    local node_guid=$(echo "${nic_guid_raw:0:7}f1${vf_hex}${nic_guid_raw:11:16}" | sed 's/../&:/g; s/:$//')
+                    local port_guid=$(echo "${nic_guid_raw:0:7}f2${vf_hex}${nic_guid_raw:11:16}" | sed 's/../&:/g; s/:$//')
+                    local sriov_path="/sys/class/infiniband/$ib_dev/device/sriov/$vf"
+
+                    if [ ! -d "$sriov_path" ]; then
+                      do_log "ERROR sriov path $sriov_path does not exist for VF $vf"
+                      continue
+                    fi
+
+                    # Set Node GUID
+                    do_log "INFO Setting Node GUID for $ib_dev VF $vf to $node_guid"
+                    echo "$node_guid" > "$sriov_path/node"
+                    if [ $? -eq 0 ]; then
+                      do_log "OK Node GUID set successfully"
+                    else
+                      do_log "ERROR Failed to set Node GUID for VF $vf"
+                      continue
+                    fi
+
+                    # Set Port GUID
+                    do_log "INFO Setting Port GUID for $ib_dev VF $vf to $port_guid"
+                    echo "$port_guid" > "$sriov_path/port"
+                    if [ $? -eq 0 ]; then
+                      do_log "OK Port GUID set successfully"
+                    else
+                      do_log "ERROR Failed to set Port GUID for VF $vf"
+                      continue
+                    fi
+
+                    # Set policy to Follow (mirror physical port state)
+                    do_log "INFO Setting policy to Follow for $ib_dev VF $vf"
+                    echo "Follow" > "$sriov_path/policy"
+                    if [ $? -eq 0 ]; then
+                      do_log "OK Policy set to Follow"
+                    else
+                      do_log "WARN Failed to set policy for VF $vf (non-critical)"
+                    fi
+
+                    # Unbind and rebind VF to make GUID changes active
+                    do_log "INFO Unbinding and rebinding VF $vf on $ib_dev to activate new GUIDs"
+                    local VF_PCI_ADDR=$(cat /sys/class/infiniband/$ib_dev/device/virtfn$vf/uevent | grep PCI_SLOT_NAME | awk -F '=' '{print $2}')
+                    echo "$VF_PCI_ADDR" > /sys/bus/pci/drivers/mlx5_core/unbind
+                    echo "$VF_PCI_ADDR" > /sys/bus/pci/drivers/mlx5_core/bind
+
+                    # Verify GUIDs were set
+                    local set_node_guid=$(cat "$sriov_path/node" 2>/dev/null)
+                    local set_port_guid=$(cat "$sriov_path/port" 2>/dev/null)
+                    do_log "INFO VF $vf verification - Node: $set_node_guid, Port: $set_port_guid"
+                  done
+                  do_log "OK Configured GUIDs for $LINKVFS VFs on $netif ($ib_dev)"
+                fi
+              fi
+            done
+
+            # Restart SRIOV Device Plugin to ensure VFs get inventoried correctly and uncordon node
+            do_log "INFO Restarting SRIOV Device Plugin to ensure VFs get inventoried correctly..."
+            kubectl delete pod -n nvidia-network-operator --field-selector="spec.nodeName=$(hostname)" -l 'app=sriov-device-plugin'
+            do_log "INFO Uncordoning node..."
+            kubectl uncordon $(hostname)
+          fi
+        }
+
+        fn_setup_nfsrdma(){
+          if [ "$NFSORDMA_ENABLED" != "true" ]; then
+            do_log "INFO NFSoRDMA not enabled, skipping..."
+            return
+          fi
+
+          do_log "INFO Configuring NFSoRDMA support..."
+
+          # Ensure mlnx-nfsrdma-dkms is installed (provides rpcrdma compatible with OFED)
+          if ! dpkg -s mlnx-nfsrdma-dkms &>/dev/null; then
+            do_log "INFO Installing mlnx-nfsrdma-dkms for NFSoRDMA support..."
+            NEEDRESTART_MODE=l apt-get install -y mlnx-nfsrdma-dkms
+            fn_process_result $? "Install mlnx-nfsrdma-dkms"
+          else
+            do_log "OK mlnx-nfsrdma-dkms is installed"
+          fi
+
+          # Load NFSoRDMA modules
+          do_log "INFO Loading NFSoRDMA kernel modules..."
+          modprobe rpcrdma 2>/dev/null || true
+          modprobe xprtrdma 2>/dev/null || true
+          modprobe svcrdma 2>/dev/null || true
+
+          if lsmod | grep -q rpcrdma; then
+            do_log "OK rpcrdma module loaded"
+          else
+            do_log "WARN rpcrdma module not loaded - may need reboot"
+          fi
+
+          # Configure RDMA interface IP
+          if [ -n "$RDMA_INTERFACE" ] && [ -d "/sys/class/net/$RDMA_INTERFACE" ]; then
+            # Bring interface up first
+            ip link set $RDMA_INTERFACE up 2>/dev/null || true
+
+            # Check if IP already assigned
+            if ! ip addr show dev $RDMA_INTERFACE | grep -q "inet "; then
+              if [ -f /etc/kubernetes/admin.conf ]; then
+                # Control plane node gets the server IP
+                do_log "INFO Assigning RDMA IP $NFS_SERVER_RDMA_IP/24 to $RDMA_INTERFACE (control-plane)"
+                ip addr add ${NFS_SERVER_RDMA_IP}/24 dev $RDMA_INTERFACE
+                fn_process_result $? "Configure RDMA interface $RDMA_INTERFACE with $NFS_SERVER_RDMA_IP"
+
+                # Create netplan config for persistence
+                cat > /etc/netplan/60-rdma.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    $RDMA_INTERFACE:
+      addresses:
+        - ${NFS_SERVER_RDMA_IP}/24
+NETPLAN
+                chmod 600 /etc/netplan/60-rdma.yaml
+                do_log "OK Created persistent netplan config for RDMA interface"
+
+              else
+                # Worker node - calculate IP based on hostname
+                local NODE_NUM=$(hostname | grep -oE '[0-9]+$' | tail -1)
+                if [ -z "$NODE_NUM" ]; then NODE_NUM=2; fi
+                local WORKER_IP="${NFS_CLIENT_RDMA_IP_BASE}.$((NODE_NUM + 1))"
+                do_log "INFO Assigning RDMA IP $WORKER_IP/24 to $RDMA_INTERFACE (worker)"
+                ip addr add ${WORKER_IP}/24 dev $RDMA_INTERFACE
+                fn_process_result $? "Configure RDMA interface $RDMA_INTERFACE with $WORKER_IP"
+
+                # Create netplan config for persistence
+                cat > /etc/netplan/60-rdma.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    $RDMA_INTERFACE:
+      addresses:
+        - ${WORKER_IP}/24
+NETPLAN
+                chmod 600 /etc/netplan/60-rdma.yaml
+                do_log "OK Created persistent netplan config for RDMA interface"
+              fi
+            else
+              do_log "OK RDMA interface $RDMA_INTERFACE already has IP configured"
+            fi
+          else
+            do_log "WARN RDMA interface $RDMA_INTERFACE not found - skipping IP configuration"
+          fi
+
+          # Control plane specific: Setup NFS server with RDMA
+          if [ -f /etc/kubernetes/admin.conf ] && [ "$NFS_SERVER_ON_CP" == "true" ]; then
+            do_log "INFO Setting up NFS Server with RDMA on control-plane node..."
+
+            # Install NFS server if not present
+            if ! dpkg -s nfs-kernel-server &>/dev/null; then
+              do_log "INFO Installing nfs-kernel-server..."
+              NEEDRESTART_MODE=l apt-get install -y nfs-kernel-server
+              fn_process_result $? "Install nfs-kernel-server"
+            else
+              do_log "OK nfs-kernel-server is installed"
+            fi
+
+            # Create export directory
+            if [ ! -d "$NFS_EXPORT_PATH" ]; then
+              do_log "INFO Creating NFS export directory $NFS_EXPORT_PATH..."
+              mkdir -p "$NFS_EXPORT_PATH"
+              chmod 777 "$NFS_EXPORT_PATH"
+              chown nobody:nogroup "$NFS_EXPORT_PATH"
+              fn_process_result $? "Create NFS export directory"
+            else
+              do_log "OK NFS export directory exists"
+            fi
+
+            # Ensure NFS server is running
+            systemctl enable nfs-kernel-server
+            systemctl restart nfs-kernel-server
+            fn_process_result $? "Start NFS server"
+
+            # Export filesystems
+            exportfs -ra
+            do_log "OK NFS exports applied"
+
+            # Enable RDMA transport on port 20049
+            if [ -f /proc/fs/nfsd/portlist ]; then
+              if ! grep -q "rdma 20049" /proc/fs/nfsd/portlist 2>/dev/null; then
+                do_log "INFO Enabling RDMA transport on port 20049..."
+                echo "rdma 20049" > /proc/fs/nfsd/portlist
+                fn_process_result $? "Enable NFS RDMA transport"
+              else
+                do_log "OK NFS RDMA transport already enabled"
+              fi
+            else
+              do_log "WARN /proc/fs/nfsd/portlist not available - NFS server may not be fully started"
+            fi
+
+            # Enable nfs-rdma service for persistence
+            systemctl enable nfs-rdma.service 2>/dev/null || true
+            systemctl start nfs-rdma.service 2>/dev/null || true
+
+            # Verify setup
+            do_log "INFO NFS Server RDMA configuration:"
+            cat /proc/fs/nfsd/portlist 2>/dev/null || echo "  (portlist not available)"
+            exportfs -v 2>/dev/null | head -5
+          fi
+
+          # Worker node: Test RDMA connectivity to NFS server
+          if [ ! -f /etc/kubernetes/admin.conf ] && [ -n "$NFS_SERVER_RDMA_IP" ]; then
+            do_log "INFO Testing RDMA network connectivity to NFS server..."
+            sleep 2  # Allow interface to settle
+            if ping -c 1 -W 3 $NFS_SERVER_RDMA_IP &>/dev/null; then
+              do_log "OK RDMA network connectivity to $NFS_SERVER_RDMA_IP verified"
+              do_log "INFO Pods can use PV/PVC with mountOptions: proto=rdma,port=20049,vers=4.1"
+            else
+              do_log "WARN Cannot reach NFS server at $NFS_SERVER_RDMA_IP - RDMA network may not be ready yet"
+            fi
+          fi
+
+          # Add NFSoRDMA status to node labels
+          kubectl label node $(hostname) --overwrite "spectrocloud.com/nfsordma=enabled" > /dev/null
+          do_log "OK NFSoRDMA configuration complete"
+        }
+
+        do_log "OK Spectro Cloud node preparation for Spectrum-X"
+        fn_ensure_nodeprep
+        fn_ensure_state
+
+        case "$STATE" in
+          "init")
+            NEEDREBOOT=false
+            fn_init_sw_stage
+            fn_inventory_hw
+            fn_init_hw_stage
+            if $NEEDREBOOT; then
+              fn_update_state config reboot
+            else
+              fn_update_state config
+              fn_config_stage
+              fn_update_state precomplete reboot
+            fi ;;
+
+          "config")
+            do_log "INFO Config stage: set NIC configs with mlxconfig..."
+            fn_inventory_hw
+            fn_config_stage
+            fn_update_state precomplete reboot ;;
+
+          "precomplete")
+            ;&
+          "complete")
+            do_log "INFO Complete stage: inventory HW, set VFs, configure NFSoRDMA..."
+            if $DISABLE_ACS; then fn_disable_acs; fi
+            fn_inventory_hw
+            fn_set_vfs
+            fn_setup_nfsrdma
+            # Temporary workaround for GDS bug in GPU Operator 25.10
+            mkdir -p /run/mellanox/drivers
+            touch /run/mellanox/drivers/.driver-ready
+            # End workaround
+            if [ -f /etc/kubernetes/admin.conf ]; then
+              # This is a control plane node, it can untaint itself
+              kubectl taint nodes $(hostname) spectrocloud.com/nodeprep- --kubeconfig /etc/kubernetes/admin.conf
+            fi
+            fn_update_state complete
+            do_log "OK Nodeprep complete." ;;
+
+          *)
+            do_log "ERROR Unknown state: $STATE, aborting..." ;;
+        esac
