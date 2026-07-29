@@ -115,4 +115,4 @@ See the Troubleshooting section in `nfsordma-setup-guide.md` for common issues i
 
 ## License
 
-Internal use.
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
